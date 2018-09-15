@@ -3,7 +3,9 @@ package tusd
 import (
 	"encoding/base64"
 	"errors"
+	"bytes"
 	"io"
+	"io/ioutil"
 	"log"
 	"math"
 	"net"
@@ -110,6 +112,16 @@ type UnroutedHandler struct {
 	Metrics Metrics
 }
 
+type Upload struct {
+	URL string
+    Status string
+    StatusCode int
+    Method string
+    Headers map[string]string
+    Body []byte
+    ContentLength int64
+}
+
 // NewUnroutedHandler creates a new handler without routing using the given
 // configuration. It exposes the http handlers which need to be combined with
 // a router (aka mux) of your choice. If you are looking for preconfigured
@@ -162,7 +174,7 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 			r.Method = newMethod
 		}
 
-		handler.log("RequestIncoming", "method", r.Method, "path", r.URL.Path)
+		//handler.log("RequestIncoming", "method", r.Method, "path", r.URL.Path)
 
 		go handler.Metrics.incRequestsTotal(r.Method)
 
@@ -221,6 +233,453 @@ func (handler *UnroutedHandler) Middleware(h http.Handler) http.Handler {
 		// Proceed with routing the request
 		h.ServeHTTP(w, r)
 	})
+}
+
+func (handler *UnroutedHandler) Post(req Upload)(*Upload, error){
+
+	var resp Upload
+	var err error
+	headers := make(map[string]string)
+
+	//Contains Chunk
+	var containsChunk bool
+	if val, ok := req.Headers["Content-Type"]; ok {
+		containsChunk = val == "application/offset+octet-stream"
+	}
+
+	//Concat Header
+	var concatHeader string
+	if handler.composer.UsesConcater {
+		if val, ok := req.Headers["Upload-Concat"]; ok {
+			concatHeader = val
+		}
+	}
+
+	//Parse Upload-Concat header
+	isPartial, isFinal, partialUploads, err := parseConcat(concatHeader)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Size
+	var size int64
+	var sizeIsDeferred bool
+	if isFinal {
+
+		if containsChunk {
+			return &resp, ErrModifyFinal
+		}
+
+		size, err = handler.sizeOfUploads(partialUploads)
+		if err != nil {
+			return &resp, err
+		}
+	} else {
+
+		//Upload Length Header
+		var uploadLengthHeader string
+		if val, ok := req.Headers["Upload-Length"]; ok {
+			uploadLengthHeader = val
+		}
+
+		//Upload Defer Length Header
+		var uploadDeferLengthHeader string
+		if val, ok := req.Headers["Upload-Defer-Length"]; ok {
+			uploadDeferLengthHeader = val
+		}
+
+		//Validate
+		size, sizeIsDeferred, err = handler.validateNewUploadLengthHeaders(uploadLengthHeader, uploadDeferLengthHeader)
+		if err != nil {
+			return &resp, err
+		}
+	}
+
+	//Test
+	if handler.config.MaxSize > 0 && size > handler.config.MaxSize {
+		return &resp, ErrMaxSizeExceeded
+	}
+
+	//MetaData
+	var uploadMetadataHeader string
+	if val, ok := req.Headers["Upload-Metadata"]; ok {
+		uploadMetadataHeader = val
+	}
+
+	//Parse
+	meta := ParseMetadataHeader(uploadMetadataHeader)
+
+	//Info
+	info := FileInfo{
+		Size:           size,
+		SizeIsDeferred: sizeIsDeferred,
+		MetaData:       meta,
+		IsPartial:      isPartial,
+		IsFinal:        isFinal,
+		PartialUploads: partialUploads,
+	}
+
+	//ID
+	id, err := handler.composer.Core.NewUpload(info)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Set
+	info.ID = id
+
+	//URL
+	url := handler.AbsFileURL(id)
+	headers["Location"] = url
+
+	//Metrics
+	go handler.Metrics.incUploadsCreated()
+
+	//Chan
+	if handler.config.NotifyCreatedUploads {
+		handler.CreatedUploads <- info
+	}
+
+	//Is Final
+	if isFinal {
+		if err := handler.composer.Concater.ConcatUploads(id, partialUploads); err != nil {
+			return &resp, err
+		}
+		info.Offset = size
+
+		if handler.config.NotifyCompleteUploads {
+			handler.CompleteUploads <- info
+		}
+	}
+
+	//Contains Chunk
+	if containsChunk {
+
+		//Locker
+		if handler.composer.UsesLocker {
+			locker := handler.composer.Locker
+			if err := locker.LockUpload(id); err != nil {
+				return &resp, err
+			}
+
+			defer locker.UnlockUpload(id)
+		}
+
+		//Write Chunk
+		newOffset, err := handler.WriteChunk(id, info, req)
+		if err != nil {
+			return &resp, err
+		}
+		headers["Upload-Offset"] = strconv.FormatInt(newOffset, 10)
+	} else if !sizeIsDeferred && size == 0 {
+
+		//Finish
+		handler.finishUploadIfComplete(info)
+	}
+
+	//Set
+	resp.Headers = headers
+	resp.StatusCode = http.StatusCreated
+
+	return &resp, err
+}
+
+func (handler *UnroutedHandler) Patch(req Upload)(*Upload, error){
+
+	var resp Upload
+	var err error
+	headers := make(map[string]string)
+
+	//Contains Chunk
+	if val, ok := req.Headers["Content-Type"]; ok {
+		if val != "application/offset+octet-stream"{
+			return &resp, ErrInvalidContentType
+		}
+	}
+
+	//Upload Offset
+	var uploadOffsetHeader string
+	if val, ok := req.Headers["Upload-Offset"]; ok {
+		uploadOffsetHeader = val
+	}
+	offset, err := strconv.ParseInt(uploadOffsetHeader, 10, 64)
+	if err != nil || offset < 0 {
+		return &resp, ErrInvalidOffset
+	}
+
+	//ID
+	id, err := extractIDFromPath(req.URL)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Locker
+	if handler.composer.UsesLocker {
+		locker := handler.composer.Locker
+		if err := locker.LockUpload(id); err != nil {
+			return &resp, err
+		}
+
+		defer locker.UnlockUpload(id)
+	}
+
+	//Get Info
+	info, err := handler.composer.Core.GetInfo(id)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Not Allowed On FInal
+	if info.IsFinal {
+		return &resp, ErrModifyFinal
+	}
+
+	if offset != info.Offset {
+		return &resp, ErrMismatchOffset
+	}
+
+	//No If Complete
+	if !info.SizeIsDeferred && info.Offset == info.Size {
+
+		//Set
+		headers["Upload-Offset"] = strconv.FormatInt(offset, 10)
+		resp.StatusCode = http.StatusNoContent
+		return &resp, err
+
+	}
+
+	//Upload Length
+	var uploadLengthHeader string
+	if val, ok := req.Headers["Upload-Length"]; ok {
+		uploadLengthHeader = val
+	}
+	if uploadLengthHeader != "" {
+		if !handler.composer.UsesLengthDeferrer {
+			return &resp, ErrNotImplemented
+		}
+		if !info.SizeIsDeferred {
+			return &resp, ErrInvalidUploadLength
+		}
+		uploadLength, err := strconv.ParseInt(uploadLengthHeader, 10, 64)
+		if err != nil || uploadLength < 0 || uploadLength < info.Offset || (handler.config.MaxSize > 0 && uploadLength > handler.config.MaxSize) {
+			return &resp, ErrInvalidUploadLength
+		}
+		if err := handler.composer.LengthDeferrer.DeclareLength(id, uploadLength); err != nil {
+			return &resp, err
+		}
+
+		info.Size = uploadLength
+		info.SizeIsDeferred = false
+	}
+
+	//Write Chunk
+	newOffset, err := handler.WriteChunk(id, info, req)
+	if err != nil {
+		return &resp, err
+	}
+	headers["Upload-Offset"] = strconv.FormatInt(newOffset, 10)
+
+	//Set
+	resp.Headers = headers
+	resp.StatusCode = http.StatusNoContent
+
+	return &resp, err
+}
+
+func (handler *UnroutedHandler) Get(req Upload)(*Upload, error){
+
+	var resp Upload
+	var err error
+	headers := make(map[string]string)
+
+	//Uses Reader
+	if !handler.composer.UsesGetReader {
+		return &resp, ErrNotImplemented
+	}
+
+	//ID
+	id, err := extractIDFromPath(req.URL)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Locker
+	if handler.composer.UsesLocker {
+		locker := handler.composer.Locker
+		if err := locker.LockUpload(id); err != nil {
+			return &resp, err
+		}
+
+		defer locker.UnlockUpload(id)
+	}
+
+	//Info
+	info, err := handler.composer.Core.GetInfo(id)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Headers
+	headers["Content-Length"] = strconv.FormatInt(info.Offset, 10)
+
+	//Content Type
+	contentType, contentDisposition := filterContentType(info)
+	headers["Content-Type"] = contentType
+	headers["Content-Disposition"] = contentDisposition
+
+	//No Data
+	if info.Offset == 0 {
+		resp.StatusCode = http.StatusNoContent
+		return &resp, err
+	}
+
+	//Reader
+	reader, err := handler.composer.GetReader.GetReader(id)
+	if err != nil {
+		return &resp, err
+	}
+
+	//To Bytes
+	var body []byte
+	if reader != nil {
+		body, err = ioutil.ReadAll(reader)
+		if err != nil {
+			return &resp, err
+		}
+	}
+
+
+	//Set
+	resp.Body = body
+	resp.Headers = headers
+	resp.StatusCode = http.StatusOK
+
+	return &resp, err
+}
+
+func (handler *UnroutedHandler) Head(req Upload)(*Upload, error){
+
+	var resp Upload
+	var err error
+	headers := make(map[string]string)
+
+	//ID
+	id, err := extractIDFromPath(req.URL)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Locker
+	if handler.composer.UsesLocker {
+		locker := handler.composer.Locker
+		if err := locker.LockUpload(id); err != nil {
+			return &resp, err
+		}
+
+		defer locker.UnlockUpload(id)
+	}
+
+	//Info
+	info, err := handler.composer.Core.GetInfo(id)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Upload-Concat
+	if info.IsPartial {
+		headers["Upload-Concat"] = "partial"
+	}
+
+	//Final
+	if info.IsFinal {
+		v := "final;"
+		for _, uploadID := range info.PartialUploads {
+			v += handler.AbsFileURL(uploadID) + " "
+		}
+		// Remove trailing space
+		v = v[:len(v)-1]
+
+		headers["Upload-Concat"] = v
+	}
+
+	//MetaData
+	if len(info.MetaData) != 0 {
+		headers["Upload-Metadata"] = SerializeMetadataHeader(info.MetaData)
+	}
+
+	//Deferred
+	if info.SizeIsDeferred {
+		headers["Upload-Defer-Length"] = UploadLengthDeferred
+	} else {
+		headers["Upload-Length"] = strconv.FormatInt(info.Size, 10)
+	}
+
+	//Headers
+	headers["Cache-Control"] = "no-store"
+	headers["Upload-Offset"] = strconv.FormatInt(info.Offset, 10)
+
+	//Set
+	resp.Headers = headers
+	resp.StatusCode = http.StatusOK
+
+	return &resp, err
+}
+
+func (handler *UnroutedHandler) Delete(req Upload)(*Upload, error){
+
+	var resp Upload
+	var err error
+	headers := make(map[string]string)
+
+	//About
+	if !handler.composer.UsesTerminater {
+		return &resp, ErrNotImplemented
+	}
+
+	//ID
+	id, err := extractIDFromPath(req.URL)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Locker
+	if handler.composer.UsesLocker {
+		locker := handler.composer.Locker
+		if err := locker.LockUpload(id); err != nil {
+			return &resp, err
+		}
+
+		defer locker.UnlockUpload(id)
+	}
+
+	//Info
+	var info FileInfo
+	if handler.config.NotifyTerminatedUploads {
+		info, err = handler.composer.Core.GetInfo(id)
+		if err != nil {
+			return &resp, err
+		}
+	}
+
+	//Terminate
+	err = handler.composer.Terminater.Terminate(id)
+	if err != nil {
+		return &resp, err
+	}
+
+	//Notify
+	if handler.config.NotifyTerminatedUploads {
+		handler.TerminatedUploads <- info
+	}
+
+	go handler.Metrics.incUploadsTerminated()
+
+	//Set
+	resp.Headers = headers
+	resp.StatusCode = http.StatusNoContent
+
+	return &resp, err
+
 }
 
 // PostFile creates a new file upload using the datastore after validating the
@@ -304,7 +763,7 @@ func (handler *UnroutedHandler) PostFile(w http.ResponseWriter, r *http.Request)
 	w.Header().Set("Location", url)
 
 	go handler.Metrics.incUploadsCreated()
-	handler.log("UploadCreated", "id", id, "size", i64toa(size), "url", url)
+	//handler.log("UploadCreated", "id", id, "size", i64toa(size), "url", url)
 
 	if handler.config.NotifyCreatedUploads {
 		handler.CreatedUploads <- info
@@ -491,6 +950,70 @@ func (handler *UnroutedHandler) PatchFile(w http.ResponseWriter, r *http.Request
 	handler.sendResp(w, r, http.StatusNoContent)
 }
 
+func (handler *UnroutedHandler) WriteChunk(id string, info FileInfo, req Upload) (int64, error) {
+
+	//Offset
+	var newOffset int64
+
+	//Content
+	length := req.ContentLength
+	offset := info.Offset
+
+	//Fits
+	if !info.SizeIsDeferred && offset+length > info.Size {
+		return newOffset, ErrSizeExceeded
+	}
+
+	//Max Size
+	/*
+	maxSize := info.Size - offset
+
+	//Vars
+	if info.SizeIsDeferred {
+		if handler.config.MaxSize > 0 {
+			maxSize = handler.config.MaxSize - offset
+		} else {
+			maxSize = math.MaxInt64
+		}
+	}
+	if length > 0 {
+		maxSize = length
+	}
+	*/
+
+	//Bytes Written
+	var bytesWritten int64
+
+	//Has Body
+	if len(req.Body) > 0 {
+
+		//Reader
+		reader := bytes.NewReader(req.Body)
+
+		//Chan
+		if handler.config.NotifyUploadProgress {
+			var stop chan<- struct{}
+			//reader, stop = handler.sendProgressMessages(info, reader)
+			defer close(stop)
+		}
+
+		var err error
+		bytesWritten, err = handler.composer.Core.WriteChunk(id, offset, reader)
+		if err != nil {
+			return newOffset, err
+		}
+
+	}
+
+	//Set
+	newOffset = offset + bytesWritten
+	go handler.Metrics.incBytesReceived(uint64(bytesWritten))
+	info.Offset = newOffset
+
+	//Return
+	return newOffset, handler.finishUploadIfComplete(info)
+}
+
 // writeChunk reads the body from the requests r and appends it to the upload
 // with the corresponding id. Afterwards, it will set the necessary response
 // headers but will not send the response.
@@ -521,7 +1044,7 @@ func (handler *UnroutedHandler) writeChunk(id string, info FileInfo, w http.Resp
 		maxSize = length
 	}
 
-	handler.log("ChunkWriteStart", "id", id, "maxSize", i64toa(maxSize), "offset", i64toa(offset))
+	//handler.log("ChunkWriteStart", "id", id, "maxSize", i64toa(maxSize), "offset", i64toa(offset))
 
 	var bytesWritten int64
 	// Prevent a nil pointer dereference when accessing the body which may not be
@@ -543,7 +1066,7 @@ func (handler *UnroutedHandler) writeChunk(id string, info FileInfo, w http.Resp
 		}
 	}
 
-	handler.log("ChunkWriteComplete", "id", id, "bytesWritten", i64toa(bytesWritten))
+	//handler.log("ChunkWriteComplete", "id", id, "bytesWritten", i64toa(bytesWritten))
 
 	// Send new offset to client
 	newOffset := offset + bytesWritten
@@ -776,7 +1299,7 @@ func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request
 	w.WriteHeader(statusErr.StatusCode())
 	w.Write([]byte(reason))
 
-	handler.log("ResponseOutgoing", "status", strconv.Itoa(statusErr.StatusCode()), "method", r.Method, "path", r.URL.Path, "error", err.Error())
+	//handler.log("ResponseOutgoing", "status", strconv.Itoa(statusErr.StatusCode()), "method", r.Method, "path", r.URL.Path, "error", err.Error())
 
 	go handler.Metrics.incErrorsTotal(statusErr)
 }
@@ -785,7 +1308,7 @@ func (handler *UnroutedHandler) sendError(w http.ResponseWriter, r *http.Request
 func (handler *UnroutedHandler) sendResp(w http.ResponseWriter, r *http.Request, status int) {
 	w.WriteHeader(status)
 
-	handler.log("ResponseOutgoing", "status", strconv.Itoa(status), "method", r.Method, "path", r.URL.Path)
+	//handler.log("ResponseOutgoing", "status", strconv.Itoa(status), "method", r.Method, "path", r.URL.Path)
 }
 
 // Make an absolute URLs to the given upload id. If the base path is absolute
@@ -801,6 +1324,10 @@ func (handler *UnroutedHandler) absFileURL(r *http.Request, id string) string {
 	url := proto + "://" + host + handler.basePath + id
 
 	return url
+}
+
+func (handler *UnroutedHandler) AbsFileURL(id string) string {
+	return handler.basePath + id
 }
 
 type progressWriter struct {

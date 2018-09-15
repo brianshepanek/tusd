@@ -91,7 +91,7 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/tus/tusd"
+	"github.com/brianshepanek/tusd"
 	"github.com/tus/tusd/uid"
 
 	"github.com/aws/aws-sdk-go/aws"

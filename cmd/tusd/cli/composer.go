@@ -3,7 +3,7 @@ package cli
 import (
 	"os"
 
-	"github.com/tus/tusd"
+	"github.com/brianshepanek/tusd"
 	"github.com/tus/tusd/filestore"
 	"github.com/tus/tusd/limitedstore"
 	"github.com/tus/tusd/memorylocker"

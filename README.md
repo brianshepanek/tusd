@@ -148,7 +148,7 @@ import (
 	"fmt"
 	"net/http"
 
-	"github.com/tus/tusd"
+	"github.com/brianshepanek/tusd"
 	"github.com/tus/tusd/filestore"
 )
 

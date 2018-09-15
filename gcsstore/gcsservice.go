@@ -92,6 +92,14 @@ func NewGCSService(filename string) (*GCSService, error) {
 	return service, nil
 }
 
+func NewGCSServiceFromClient(client *storage.Client) (*GCSService, error) {
+	service := &GCSService{
+		Client: client,
+	}
+
+	return service, nil
+}
+
 // GetObjectSize returns the byte length of the specified GCS object.
 func (service *GCSService) GetObjectSize(ctx context.Context, params GCSObjectParams) (int64, error) {
 	attrs, err := service.GetObjectAttrs(ctx, params)
